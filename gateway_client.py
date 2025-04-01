@@ -186,6 +186,7 @@ async def flash_device(job_id: int, device_id: int):
     try:
         subprocess.check_call(flash_cmd)
         print(f"Flashed {source_path} to {port}")
+        await update_job_status(job_id, "running")
     except subprocess.CalledProcessError as e:
         print(f"Flashing failed: {str(e)}")
         await update_job_status(job_id, "failed")
@@ -240,13 +241,35 @@ async def collect_logs(job_id: int, device_id: int):
                         time.sleep(0.5)
                         
         print(f"Log collection completed, saved to {log_path}")
-        # await upload_logs(job_id, log_path)
+        await upload_logs(job_id, log_path)
         await update_job_status(job_id, "completed")
         
     except Exception as e:
         print(f"Log collection failed: {str(e)}")
         await update_job_status(job_id, "failed")
-        # You might want to add partial log upload even if failed
+
+async def upload_logs(job_id: int, log_path: str):
+    upload_url = f"{SERVER_URL}/api/v1/jobs/{job_id}/logs"
+    headers = {"X-Gateway-Token": GATEWAY_TOKEN}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            form_data = aiohttp.FormData()
+            form_data.add_field(
+                "log_file",
+                open(log_path, "rb"),
+                filename=f"{job_id}.txt"
+            )
+
+            async with session.post(upload_url, headers=headers, data=form_data) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    print(f"Log upload failed: {response.status} {text}")
+                    return False
+                return True
+    except Exception as e:
+        print(f"Log upload error: {str(e)}")
+        return False
 
 async def main():
     await asyncio.gather(
