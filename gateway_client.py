@@ -59,6 +59,8 @@ async def handle_job_notification(job_data: dict):
         
         # Flash the device
         await flash_device(job_id, device_id)
+
+        await asyncio.sleep(5)
         
         # Start log collection
         await collect_logs(job_id, device_id)
