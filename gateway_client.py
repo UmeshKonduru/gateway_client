@@ -193,24 +193,60 @@ async def flash_device(job_id: int, device_id: int):
 async def collect_logs(job_id: int, device_id: int):
     port = get_device_port(device_id)
     log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
     
     try:
-        # Example using pyserial
         import serial
-        with serial.Serial(port, baudrate=115200, timeout=5) as ser:
-            with open(log_path, "w") as f:
-                start_time = time.time()
-                while time.time() - start_time < 30:  # Collect for 30s
-                    line = ser.readline().decode('utf-8', 'ignore')
-                    f.write(line)
-                    f.flush()
+        import time
         
+        # Add a small delay to ensure device is ready
+        time.sleep(1)
+        
+        with serial.Serial(port, baudrate=115200, timeout=1) as ser:
+            with open(log_path, "w") as f:
+                print(f"Started collecting logs from {port}")
+                start_time = time.time()
+                consecutive_empty_reads = 0
+                max_empty_reads = 10
+                
+                while time.time() - start_time < 30:  # Collect for 30s
+                    try:
+                        if ser.in_waiting > 0:
+                            line = ser.readline().decode('utf-8', 'ignore')
+                            if line:
+                                f.write(line)
+                                f.flush()
+                                consecutive_empty_reads = 0
+                                print(f"Log: {line.strip()}")
+                            else:
+                                consecutive_empty_reads += 1
+                        else:
+                            time.sleep(0.1)  # Prevent CPU spinning
+                            
+                        # Break if we get too many consecutive empty reads
+                        if consecutive_empty_reads >= max_empty_reads:
+                            print(f"Received {max_empty_reads} consecutive empty reads. Checking if device is still connected...")
+                            ser.reset_input_buffer()
+                            ser.reset_output_buffer()
+                            consecutive_empty_reads = 0
+                            
+                    except serial.SerialException as se:
+                        print(f"Serial error: {se}. Attempting to reconnect...")
+                        ser.close()
+                        time.sleep(2)
+                        ser.open()
+                    except Exception as e:
+                        print(f"Error reading line: {e}")
+                        time.sleep(0.5)
+                        
+        print(f"Log collection completed, saved to {log_path}")
         # await upload_logs(job_id, log_path)
         await update_job_status(job_id, "completed")
         
     except Exception as e:
         print(f"Log collection failed: {str(e)}")
         await update_job_status(job_id, "failed")
+        # You might want to add partial log upload even if failed
 
 async def main():
     await asyncio.gather(
