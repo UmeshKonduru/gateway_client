@@ -188,11 +188,26 @@ async def flash_device(job_id: int, device_id: int):
         await update_job_status(job_id, "failed")
 
 async def collect_logs(job_id: int, device_id: int):
-    """Placeholder for log collection functionality"""
-    print(f"Collecting logs for job {job_id}")
-    # TODO: Implement actual log collection
-    await asyncio.sleep(5)  # Simulate log collection
-    await update_job_status(job_id, "completed")
+    port = get_device_port(device_id)
+    log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
+    
+    try:
+        # Example using pyserial
+        import serial
+        with serial.Serial(port, baudrate=115200, timeout=5) as ser:
+            with open(log_path, "w") as f:
+                start_time = time.time()
+                while time.time() - start_time < 30:  # Collect for 30s
+                    line = ser.readline().decode('utf-8', 'ignore')
+                    f.write(line)
+                    f.flush()
+        
+        # await upload_logs(job_id, log_path)
+        await update_job_status(job_id, "completed")
+        
+    except Exception as e:
+        print(f"Log collection failed: {str(e)}")
+        await update_job_status(job_id, "failed")
 
 async def main():
     await asyncio.gather(
