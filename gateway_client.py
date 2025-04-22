@@ -2,39 +2,35 @@ import asyncio
 import os
 import aiohttp
 import time
-import subprocess  # used for synchronous compilation; alternatively, asyncio.subprocess can be used
-from redis_client import redis_client  # assuming redis_client is imported correctly
-from gateway_add_device import get_device_port  # assuming this function is defined in gateway_add_device.py
+import subprocess
+from redis_client import redis_client
+from gateway_add_device import get_device_port
+import serial_asyncio  # New dependency: pip install pyserial-asyncio
 
-# Gateway configuration (update these as needed)
-GATEWAY_ID = 1  # Unique ID for this gateway
-GATEWAY_TOKEN = "abcdefgh12345678"  # Registration token for authentication
-SERVER_URL = "http://192.168.43.56:8000"  # API server URL (adjust IP/port as needed)
+# Configuration
+GATEWAY_ID = 1
+GATEWAY_TOKEN = "abcdefgh12345678"
+SERVER_URL = "http://192.168.43.56:8000"
 DOWNLOAD_DIR = "./downloads"
+MAX_CONCURRENT_JOBS = 4  # Adjust based on gateway hardware capabilities
 
-# Ensure the download directory exists
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Semaphore for concurrent job processing
+job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 async def poll_for_download_notifications():
-    # Initialize Redis connection if not already initialized
     await redis_client.init()
     print("Polling for download notifications...")
-
     while True:
-        notification = await redis_client.get_download_notification(GATEWAY_ID)
-        if notification:
-            print("Received notification:", notification)
-            job_id = notification.get("job_id")
-            source_file_id = notification.get("source_file_id")
-            if job_id and source_file_id:
-                # Download file, compile it, and update job status
-                await process_job(job_id, source_file_id)
-            else:
-                print("Invalid notification format:", notification)
-        else:
-            print("No notification received.")
-        # Poll every 1 second
-        await asyncio.sleep(1)
+        try:
+            notification = await redis_client.get_download_notification(GATEWAY_ID)
+            if notification:
+                asyncio.create_task(process_job(
+                    notification['job_id'],
+                    notification['source_file_id']
+                ))
+        except Exception as e:
+            print(f"Download notification error: {str(e)}")
+        await asyncio.sleep(0.1)
 
 async def poll_for_job_notifications():
     await redis_client.init()
@@ -43,233 +39,174 @@ async def poll_for_job_notifications():
         try:
             job_data = await redis_client.get_job(GATEWAY_ID)
             if job_data:
-                await handle_job_notification(job_data)
+                asyncio.create_task(handle_job_notification(job_data))
         except Exception as e:
             print(f"Job notification error: {str(e)}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
 
 async def handle_job_notification(job_data: dict):
-    try:
-        job_id = job_data['job_id']
-        device_id = job_data['device_id']
-        print(f"Received job {job_id} for device {device_id}")
-        
-        # Update status to 'running' before flashing
-        await update_job_status(job_id, "running")
-        
-        # Flash the device
-        await flash_device(job_id, device_id)
-
-        await asyncio.sleep(5)
-        
-        # Start log collection
-        await collect_logs(job_id, device_id)
-        
-    except KeyError as e:
-        print(f"Invalid job notification format: {str(e)}")
-    except Exception as e:
-        print(f"Job processing failed: {str(e)}")
-        await update_job_status(job_id, "failed")
+    async with job_semaphore:
+        try:
+            job_id = job_data['job_id']
+            device_id = job_data['device_id']
+            print(f"Starting parallel processing for job {job_id} on device {device_id}")
+            
+            # Create independent tasks for flashing and logging
+            flash_task = asyncio.create_task(flash_device(job_id, device_id))
+            log_task = asyncio.create_task(collect_logs(job_id, device_id))
+            
+            await asyncio.gather(flash_task, log_task)
+            
+        except KeyError as e:
+            print(f"Invalid job notification format: {str(e)}")
+        except Exception as e:
+            print(f"Job processing failed: {str(e)}")
+            await update_job_status(job_id, "failed")
 
 async def download_file(job_id: int, file_id: int) -> str:
-    """
-    Downloads the source file into a job-specific directory
-    Returns path to the downloaded file
-    """
     download_url = f"{SERVER_URL}/api/v1/gateways/download/{file_id}"
     headers = {"X-Gateway-Token": GATEWAY_TOKEN}
     
-    # Create job-specific directory
     job_dir = os.path.join(DOWNLOAD_DIR, str(job_id))
     os.makedirs(job_dir, exist_ok=True)
     
-    print(f"[Job {job_id}] Downloading file {file_id}...")
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url, headers=headers) as response:
             if response.status == 200:
-                # Get filename from headers or generate default
                 disposition = response.headers.get("Content-Disposition", "")
-                if "filename=" in disposition:
-                    filename = disposition.split("filename=")[-1].strip('"')
-                else:
-                    filename = f"job_{job_id}_source.bin"
+                filename = (disposition.split("filename=")[-1].strip('"') 
+                            if "filename=" in disposition 
+                            else f"job_{job_id}_source.bin")
                 
                 filepath = os.path.join(job_dir, filename)
-                
-                # Save file contents
                 content = await response.read()
+                
                 with open(filepath, "wb") as f:
                     f.write(content)
                 
-                print(f"[Job {job_id}] File saved to {filepath}")
                 return filepath
             else:
                 text = await response.text()
-                print(f"[Job {job_id}] Download failed: {response.status} {text}")
-                raise Exception(f"Download failed for job {job_id}")
+                raise Exception(f"Download failed: {response.status} {text}")
 
-def compile_source_code(job_id: int) -> str:
-    """
-    Compiles source code in the job-specific directory
-    Returns path to compiled binary
-    """
+async def compile_source_code(job_id: int):
     source_path = f"./downloads/{job_id}"
+    compile_cmd = ["make", f"SRC_DIR={source_path}"]
     
-    print(f"[Job {job_id}] Compiling in {source_path}...")
+    proc = await asyncio.create_subprocess_exec(
+        *compile_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
     
-    try:
-        # Example compilation command - replace with your actual toolchain
-        compile_cmd = [
-            "make", 
-            f"SRC_DIR={source_path}",
-        ]
-        
-        # Synchronous compilation for simplicity
-        subprocess.check_call(compile_cmd)
-        
-        print(f"[Job {job_id}] Compilation successful")
-        
-    except subprocess.CalledProcessError as e:
-        print(f"[Job {job_id}] Compilation failed: {e}")
-        raise Exception("Compilation failed") from e
-
-async def update_job_status(job_id: int, new_status: str):
-    """
-    Calls the job status update endpoint to set the job status to the given new_status.
-    """
-    update_url = f"{SERVER_URL}/api/v1/jobs/{job_id}/status"
-    payload = {"status": new_status}  # you can include additional data if needed
-    async with aiohttp.ClientSession() as session:
-        async with session.put(update_url, json=payload) as response:
-            if response.status == 200:
-                print(f"Job {job_id} status updated to {new_status}")
-            else:
-                text = await response.text()
-                print(f"Failed to update job status: HTTP {response.status} {text}")
-                raise Exception("Job status update failed")
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        raise Exception(f"Compilation failed:\n{stderr.decode()}")
 
 async def process_job(job_id: int, file_id: int):
-    try:
-        # Create job directory structure
-        job_dir = os.path.join(DOWNLOAD_DIR, str(job_id))
-        os.makedirs(job_dir, exist_ok=True)
-        
-        # Step 1: Download the source file
-        source_file_path = await download_file(job_id, file_id)
-        
-        # Step 2: Compile in the job directory
-        compile_source_code(job_id)
-        
-        # Step 3: Update job status
-        await update_job_status(job_id, "pending")
-        
-    except Exception as e:
-        print(f"[Job {job_id}] Error processing job: {str(e)}")
-        await update_job_status(job_id, "failed")
+    async with job_semaphore:
+        try:
+            job_dir = os.path.join(DOWNLOAD_DIR, str(job_id))
+            os.makedirs(job_dir, exist_ok=True)
+            
+            source_file_path = await download_file(job_id, file_id)
+            await compile_source_code(job_id)
+            await update_job_status(job_id, "pending")
+            
+        except Exception as e:
+            print(f"[Job {job_id}] Error: {str(e)}")
+            await update_job_status(job_id, "failed")
 
 async def flash_device(job_id: int, device_id: int):
-    port = get_device_port(device_id)
-    if not port:
-        print(f"No port found for device {device_id}")
-        await update_job_status(job_id, "failed")
-        return
-    
-    source_path = f"./downloads/{job_id}"
-    
-    flash_cmd = [
-        "make", 
-        "flash",
-        f"PORT={port}",
-        f"SRC_DIR={source_path}",
-    ]
-    
     try:
-        subprocess.check_call(flash_cmd)
-        print(f"Flashed {source_path} to {port}")
+        port = get_device_port(device_id)
+        if not port:
+            raise Exception(f"Device {device_id} not found")
+        
+        source_path = f"./downloads/{job_id}"
+        flash_cmd = ["make", "flash", f"PORT={port}", f"SRC_DIR={source_path}"]
+        
+        proc = await asyncio.create_subprocess_exec(
+            *flash_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise Exception("Flashing timed out after 30 seconds")
+        
+        if proc.returncode != 0:
+            stderr = await proc.stderr.read()
+            raise Exception(f"Flashing failed: {stderr.decode()}")
+            
         await update_job_status(job_id, "running")
-    except subprocess.CalledProcessError as e:
-        print(f"Flashing failed: {str(e)}")
+        
+    except Exception as e:
         await update_job_status(job_id, "failed")
+        raise
 
 async def collect_logs(job_id: int, device_id: int):
-    port = get_device_port(device_id)
-    log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    
     try:
-        import serial
-        import time
+        port = get_device_port(device_id)
+        if not port:
+            raise Exception(f"Device {device_id} not found")
         
-        # Add a small delay to ensure device is ready
-        time.sleep(1)
+        log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
         
-        with serial.Serial(port, baudrate=115200, timeout=1) as ser:
-            with open(log_path, "w") as f:
-                print(f"Started collecting logs from {port}")
-                start_time = time.time()
-                consecutive_empty_reads = 0
-                max_empty_reads = 10
-                
-                while time.time() - start_time < 30:  # Collect for 30s
-                    try:
-                        if ser.in_waiting > 0:
-                            line = ser.readline().decode('utf-8', 'ignore')
-                            if line:
-                                f.write(line)
-                                f.flush()
-                                consecutive_empty_reads = 0
-                                print(f"Log: {line.strip()}")
-                            else:
-                                consecutive_empty_reads += 1
-                        else:
-                            time.sleep(0.1)  # Prevent CPU spinning
-                            
-                        # Break if we get too many consecutive empty reads
-                        if consecutive_empty_reads >= max_empty_reads:
-                            print(f"Received {max_empty_reads} consecutive empty reads. Checking if device is still connected...")
-                            ser.reset_input_buffer()
-                            ser.reset_output_buffer()
-                            consecutive_empty_reads = 0
-                            
-                    except serial.SerialException as se:
-                        print(f"Serial error: {se}. Attempting to reconnect...")
-                        ser.close()
-                        time.sleep(2)
-                        ser.open()
-                    except Exception as e:
-                        print(f"Error reading line: {e}")
-                        time.sleep(0.5)
-                        
-        print(f"Log collection completed, saved to {log_path}")
+        reader, writer = await serial_asyncio.open_serial_connection(
+            url=port,
+            baudrate=115200,
+            timeout=1
+        )
+        
+        with open(log_path, "w") as f:
+            start_time = time.time()
+            while time.time() - start_time < 30:  # 30-second collection window
+                try:
+                    line = await asyncio.wait_for(reader.readuntil(b'\n'), timeout=1)
+                    decoded = line.decode('utf-8', 'ignore').strip()
+                    f.write(decoded + "\n")
+                    f.flush()
+                except (asyncio.TimeoutError, serial_asyncio.serial.SerialException):
+                    continue
+                except Exception as e:
+                    print(f"Log collection error: {str(e)}")
+                    break
+        
         await upload_logs(job_id, log_path)
         await update_job_status(job_id, "completed")
         
     except Exception as e:
-        print(f"Log collection failed: {str(e)}")
         await update_job_status(job_id, "failed")
+        raise
+
+async def update_job_status(job_id: int, new_status: str):
+    update_url = f"{SERVER_URL}/api/v1/jobs/{job_id}/status"
+    payload = {"status": new_status}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.put(update_url, json=payload) as response:
+            if response.status != 200:
+                text = await response.text()
+                raise Exception(f"Status update failed: {response.status} {text}")
 
 async def upload_logs(job_id: int, log_path: str):
     upload_url = f"{SERVER_URL}/api/v1/jobs/{job_id}/logs"
     headers = {"X-Gateway-Token": GATEWAY_TOKEN}
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            form_data = aiohttp.FormData()
-            form_data.add_field(
-                "log_file",
-                open(log_path, "rb"),
-                filename=f"{job_id}.txt"
-            )
-
-            async with session.post(upload_url, headers=headers, data=form_data) as response:
-                if response.status != 200:
-                    text = await response.text()
-                    print(f"Log upload failed: {response.status} {text}")
-                    return False
-                return True
-    except Exception as e:
-        print(f"Log upload error: {str(e)}")
-        return False
+    
+    async with aiohttp.ClientSession() as session:
+        form_data = aiohttp.FormData()
+        form_data.add_field("log_file", open(log_path, "rb"))
+        
+        async with session.post(upload_url, headers=headers, data=form_data) as response:
+            if response.status != 200:
+                text = await response.text()
+                raise Exception(f"Log upload failed: {text}")
 
 async def main():
     await asyncio.gather(

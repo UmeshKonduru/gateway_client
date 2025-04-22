@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional
 
 class RedisClient:
     def __init__(self):
-        self.redis_url = "redis://192.168.43.56"
+        self.redis_url = "redis://192.168.43.56:6379/0"
         self._redis = None
 
     async def init(self):
