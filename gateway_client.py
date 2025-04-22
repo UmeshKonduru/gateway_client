@@ -66,18 +66,19 @@ async def handle_job_notification(job_data: dict):
         try:
             job_id = job_data['job_id']
             device_id = job_data['device_id']
-            print_status(job_id, device_id, "🚀 Starting parallel processing")
-            
-            flash_task = asyncio.create_task(flash_device(job_id, device_id))
-            log_task = asyncio.create_task(collect_logs(job_id, device_id))
-            
-            await asyncio.gather(flash_task, log_task)
-            print_status(job_id, device_id, "✅ Processing completed successfully")
+            print_status(job_id, device_id, "🚀 Starting job processing")
+
+            # Sequential execution for this job
+            await flash_device(job_id, device_id)
+            await collect_logs(job_id, device_id)
+
+            print_status(job_id, device_id, "✅ Job processing completed")
             
         except KeyError as e:
             print_status(message=f"🔴 Invalid job format: {str(e)}")
         except Exception as e:
-            print_status(job_id, device_id, f"🔴 Processing failed: {str(e)}")
+            print_status(job_id, device_id, f"🔴 Job processing failed: {str(e)}")
+            await update_job_status(job_id, "failed")
 
 async def download_file(job_id: int, file_id: int) -> str:
     print_status(job_id, message=f"⏬ Starting download of file {file_id}")
