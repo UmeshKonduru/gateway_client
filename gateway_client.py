@@ -221,9 +221,9 @@ async def collect_logs(job_id: int, device_id: int):
         log_active = False
         with open(log_path, "w") as f:
             start_time = time.time()
-            print_status(job_id, device_id, "📊 Starting log capture (timeout: 300s)")
+            print_status(job_id, device_id, "📊 Starting log capture (timeout: 1 minute)")
             
-            while time.time() - start_time < 300:  # 5 minutes timeout
+            while time.time() - start_time < 60:  # 5 minutes timeout
                 try:
                     # Read with a short timeout
                     line_bytes = await asyncio.wait_for(reader.readline(), 1.0)
