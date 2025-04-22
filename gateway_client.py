@@ -191,12 +191,18 @@ async def collect_logs(job_id: int, device_id: int):
         
         log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        
+        await asyncio.sleep(5)
+
         reader, writer = await serial_asyncio.open_serial_connection(
             url=port,
             baudrate=115200,
             timeout=1
         )
+
+        writer.transport.serial.reset_input_buffer()
+        writer.transport.serial.reset_output_buffer()
+
+        await asyncio.sleep(1)
         
         bytes_written = 0
         with open(log_path, "w") as f:
