@@ -192,52 +192,79 @@ async def collect_logs(job_id: int, device_id: int):
         log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         
-        print_status(job_id, device_id, "⏳ Waiting for device initialization (3s)")
-        await asyncio.sleep(3)
+        print_status(job_id, device_id, "⏳ Waiting for device initialization (5s)")
+        await asyncio.sleep(5)
         
+        # Open serial connection with proper settings
         reader, writer = await serial_asyncio.open_serial_connection(
             url=port,
-            baudrate=115200,
-            timeout=2
+            baudrate=115200
         )
         
-        # writer.transport.serial.reset_input_buffer()
-        # writer.transport.serial.reset_output_buffer()
-        await asyncio.sleep(0.5)
+        # Reset serial buffers
+        writer.transport.serial.reset_input_buffer()
+        writer.transport.serial.reset_output_buffer()
         
-        try:
-            with open(log_path, "w") as f:  # Changed to proper with block
-                start_time = time.time()
-                while time.time() - start_time < 30:
-                    try:
-                        # Read line with timeout
-                        line = await asyncio.wait_for(reader.readuntil(b'\n'), 1.0)
-                        decoded = line.decode('utf-8', 'ignore').strip()
+        # Toggle DTR/RTS lines to ensure device resets properly after flashing
+        writer.transport.serial.dtr = False  # Data Terminal Ready
+        writer.transport.serial.rts = False  # Request To Send
+        await asyncio.sleep(0.5)
+        writer.transport.serial.dtr = True
+        writer.transport.serial.rts = True
+        await asyncio.sleep(1)
+        
+        # Send a newline to trigger output from some devices
+        writer.write(b'\n')
+        await writer.drain()
+        
+        log_active = False
+        with open(log_path, "w") as f:
+            start_time = time.time()
+            print_status(job_id, device_id, "📊 Starting log capture (timeout: 300s)")
+            
+            while time.time() - start_time < 300:  # 5 minutes timeout
+                try:
+                    # Read with a short timeout
+                    line_bytes = await asyncio.wait_for(reader.readline(), 1.0)
+                    
+                    if not line_bytes:  # Skip empty lines
+                        continue
                         
+                    decoded = line_bytes.decode('utf-8', 'ignore').strip()
+                    if decoded:
                         # Write to both file and terminal
                         f.write(decoded + "\n")
                         f.flush()
-                        print_status(job_id, device_id, f"📄 {decoded}")  # Print to terminal
+                        print_status(job_id, device_id, f"📄 {decoded}")
+                        log_active = True
                         
-                    except asyncio.TimeoutError:
+                except asyncio.TimeoutError:
+                    # Only print waiting message if we've seen output before
+                    if log_active:
                         print_status(job_id, device_id, "⏳ No data, waiting...")
-                        continue
-                    except Exception as e:
-                        print_status(job_id, device_id, f"🔴 Log error: {str(e)}")
-                        break
-                        
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
+                    continue
+                except Exception as e:
+                    print_status(job_id, device_id, f"🔴 Log error: {str(e)}")
+                    break
+                    
+        if not log_active:
+            print_status(job_id, device_id, "⚠️ Warning: No log data received during collection period")
+            
+    except Exception as e:
+        print_status(job_id, device_id, f"🔴 Log collection failed: {str(e)}")
+        await update_job_status(job_id, "failed")
+        raise
+    else:
         print_status(job_id, device_id, "✅ Log collection completed")
         await upload_logs(job_id, log_path)
         await update_job_status(job_id, "completed")
-        
-    except Exception as e:
-        await update_job_status(job_id, "failed")
-        print_status(job_id, device_id, f"🔴 Log collection failed: {str(e)}")
-        raise
+    finally:
+        # Ensure serial connection is closed properly
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 async def update_job_status(job_id: int, new_status: str):
     try:
