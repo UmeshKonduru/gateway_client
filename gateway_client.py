@@ -107,9 +107,9 @@ async def download_file(job_id: int, file_id: int) -> str:
                 else:
                     text = await response.text()
                     raise Exception(f"Download failed: {response.status} {text}")
-        except Exception as e:
-            print_status(job_id, message=f"🔴 Download failed: {str(e)}")
-            raise
+    except Exception as e:
+        print_status(job_id, message=f"🔴 Download failed: {str(e)}")
+        raise
 
 async def compile_source_code(job_id: int):
     print_status(job_id, message="🔧 Starting compilation")
