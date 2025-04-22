@@ -191,39 +191,48 @@ async def collect_logs(job_id: int, device_id: int):
         
         log_path = os.path.join(DOWNLOAD_DIR, str(job_id), "logs.txt")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        await asyncio.sleep(5)
-
+        
+        print_status(job_id, device_id, "⏳ Waiting for device initialization (3s)")
+        await asyncio.sleep(3)
+        
         reader, writer = await serial_asyncio.open_serial_connection(
             url=port,
             baudrate=115200,
-            timeout=1
+            timeout=2
         )
-
-        writer.transport.serial.reset_input_buffer()
-        writer.transport.serial.reset_output_buffer()
-
-        await asyncio.sleep(1)
         
-        bytes_written = 0
-        with open(log_path, "w") as f:
-            start_time = time.time()
-            while time.time() - start_time < 30:
-                try:
-                    line = await asyncio.wait_for(reader.readuntil(b'\n'), timeout=1)
-                    decoded = line.decode('utf-8', 'ignore').strip()
-                    f.write(decoded + "\n")
-                    f.flush()
-                    bytes_written += len(line)
-                except (asyncio.TimeoutError, serial_asyncio.serial.SerialException):
-                    continue
-                except Exception as e:
-                    print_status(job_id, device_id, f"🔴 Log error: {str(e)}")
-                    break
+        # writer.transport.serial.reset_input_buffer()
+        # writer.transport.serial.reset_output_buffer()
+        await asyncio.sleep(0.5)
         
-        print_status(job_id, device_id, f"📊 Collected {bytes_written} bytes of logs")
+        try:
+            with open(log_path, "w") as f:  # Changed to proper with block
+                start_time = time.time()
+                while time.time() - start_time < 30:
+                    try:
+                        # Read line with timeout
+                        line = await asyncio.wait_for(reader.readuntil(b'\n'), 1.0)
+                        decoded = line.decode('utf-8', 'ignore').strip()
+                        
+                        # Write to both file and terminal
+                        f.write(decoded + "\n")
+                        f.flush()
+                        print_status(job_id, device_id, f"📄 {decoded}")  # Print to terminal
+                        
+                    except asyncio.TimeoutError:
+                        print_status(job_id, device_id, "⏳ No data, waiting...")
+                        continue
+                    except Exception as e:
+                        print_status(job_id, device_id, f"🔴 Log error: {str(e)}")
+                        break
+                        
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+        print_status(job_id, device_id, "✅ Log collection completed")
         await upload_logs(job_id, log_path)
         await update_job_status(job_id, "completed")
-        print_status(job_id, device_id, "✅ Log collection completed")
         
     except Exception as e:
         await update_job_status(job_id, "failed")
